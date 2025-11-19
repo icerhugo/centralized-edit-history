@@ -3,7 +3,7 @@
     "name": "Centralized Edit History",
   "version": "1.0.2",
     "minAppVersion": "0.15.0",
-    "description": "Centralizes note edit histories (.ceh) under .obsidian/centralized-edit-history, auto-adopts orphans on rename/open, with multilingual UI and improved reliability.",
+    "description": "Centralizes note edit histories (.ceh) in one central folder; auto-adopts orphans on rename/open; multilingual UI; improved reliability.",
     "author": "icerhugo",
     "authorUrl": "https://github.com/icerhugo",
     "isDesktopOnly": false
