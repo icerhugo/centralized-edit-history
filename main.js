@@ -4500,7 +4500,8 @@ var DEFAULT_SETTINGS = {
   diffDisplayFormat: "INLINE" /* Inline */,
   showWhitespace: true,
   debugLevel: "warn",
-  language: "zh"
+  language: "zh",
+  controlStyle: "button"
 };
 var EDIT_HISTORY_FILE_EXT = ".ceh";
 var EditHistory = class extends import_obsidian.Plugin {
@@ -4575,6 +4576,305 @@ var EditHistory = class extends import_obsidian.Plugin {
     const i = descending ? 1 : -1;
     filenames.sort((a, b) => i * (this.getEditEpoch(b) - this.getEditEpoch(a)));
   }
+  quickHash(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) {
+      h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    }
+    return h.toString();
+  }
+  normalizeText(s) {
+    if (s == null) return s;
+    // Normalize line endings to \n and strip BOM
+    if (s.length > 0 && s.charCodeAt(0) === 0xFEFF) {
+      s = s.slice(1);
+    }
+    s = s.replace(/\r\n/g, "\n");
+    s = s.replace(/\r/g, "\n");
+    return s;
+  }
+  async sha128Hex(s) {
+    const mask64 = (1n << 64n) - 1n;
+    let h1 = 0x9e3779b185ebca87n;
+    let h2 = 0xc2b2ae3d27d4eb4fn;
+    for (let i = 0; i < s.length; i++) {
+      const c = BigInt(s.charCodeAt(i));
+      h1 = ((h1 ^ c) * 0x100000001b3n) & mask64;
+      h2 = ((h2 ^ (c << 1n)) * 0x9ddfea08eb382d69n) & mask64;
+    }
+    h1 ^= h2; h2 ^= h1;
+    h1 = (h1 * 0x94d049bb133111ebn) & mask64;
+    h2 = (h2 * 0x2545f4914f6cdd1dn) & mask64;
+    const hex1 = h1.toString(16).padStart(16, "0");
+    const hex2 = h2.toString(16).padStart(16, "0");
+    return hex1 + hex2;
+  }
+  async getLatestRawFromZipArrayBuffer(arrBuf) {
+    const zip = new import_jszip.default();
+    await zip.loadAsync(arrBuf);
+    const fps = [];
+    zip.forEach(function(relativePath) { fps.push(relativePath); });
+    this.sortEdits(fps);
+    for (let fp of fps) {
+      if (!this.getEditIsDiff(fp)) {
+        const s = await zip.file(fp).async("string");
+        return s;
+      }
+    }
+    return null;
+  }
+  async cleanOrphansRenameToHash(limit = 100) {
+    const root = this.editHistoryRootFolder;
+    const listAll = async (dir) => {
+      const res = await this.app.vault.adapter.list(dir).catch(() => null);
+      if (!res) return [];
+      let files = res.files || [];
+      const folders = res.folders || [];
+      for (let f of folders) files = files.concat(await listAll(f));
+      return files;
+    };
+    const all = await listAll(root);
+    const orphans = [];
+    for (let p of all) {
+      if (!p.endsWith(EDIT_HISTORY_FILE_EXT)) continue;
+      const rel = p.substring(root.length + 1);
+      const notePath = rel.substring(0, rel.length - EDIT_HISTORY_FILE_EXT.length);
+      const note = this.app.vault.getAbstractFileByPath(notePath);
+      if (!(note && note instanceof import_obsidian.TFile)) {
+        const st = await this.app.vault.adapter.stat(p).catch(() => null);
+        const m = st && st.mtime ? st.mtime : 0;
+        orphans.push({ p, m });
+      }
+    }
+    orphans.sort((a, b) => b.m - a.m);
+    const keep = orphans.slice(0, limit);
+    const drop = orphans.slice(limit);
+    const orphanRoot = (0, import_obsidian.normalizePath)(root + "/_ORPHAN");
+    const orphanArchive = (0, import_obsidian.normalizePath)(orphanRoot + "/_ARCHIVE");
+    await this.app.vault.adapter.mkdir(orphanRoot).catch(() => null);
+    await this.app.vault.adapter.mkdir(orphanArchive).catch(() => null);
+    for (let o of keep) {
+      const data = await this.app.vault.adapter.readBinary(o.p).catch(() => null);
+      if (data == null) continue;
+      const latest = await this.getLatestRawFromZipArrayBuffer(data);
+      if (latest == null) continue;
+      const hash = await this.sha128Hex(this.normalizeText(latest));
+      const dest = (0, import_obsidian.normalizePath)(orphanRoot + "/" + hash + EDIT_HISTORY_FILE_EXT);
+      const dir = dest.substring(0, dest.lastIndexOf("/") + 1);
+      await this.app.vault.adapter.mkdir(dir).catch(() => null);
+      await this.app.vault.adapter.writeBinary(dest, data).catch(() => null);
+      await this.app.vault.adapter.remove(o.p).catch(() => null);
+    }
+    for (let o of drop) {
+      const data = await this.app.vault.adapter.readBinary(o.p).catch(() => null);
+      if (data == null) continue;
+      const latest = await this.getLatestRawFromZipArrayBuffer(data);
+      if (latest == null) continue;
+      const hash = await this.sha128Hex(this.normalizeText(latest));
+      const dest = (0, import_obsidian.normalizePath)(orphanArchive + "/" + hash + EDIT_HISTORY_FILE_EXT);
+      const dir = dest.substring(0, dest.lastIndexOf("/") + 1);
+      await this.app.vault.adapter.mkdir(dir).catch(() => null);
+      await this.app.vault.adapter.writeBinary(dest, data).catch(() => null);
+      await this.app.vault.adapter.remove(o.p).catch(() => null);
+    }
+  }
+  async onFileOpenAutoAdopt(file) {
+    if (!(file && this.keepEditHistoryForFile(file))) return;
+    const target = this.getEditHistoryFilepath(file.path);
+    const exists = this.app.vault.getAbstractFileByPath(target);
+    if (exists && exists instanceof import_obsidian.TFile) {
+      const data = await this.app.vault.adapter.readBinary(target).catch(() => null);
+      if (data != null) {
+        try {
+          const zip = new import_jszip.default();
+          await zip.loadAsync(data);
+          const fps = [];
+          zip.forEach(function(relativePath) { fps.push(relativePath); });
+          this.sortEdits(fps);
+          this.statusBarItemEl.setText(fps.length + " edits");
+        } catch (_) {}
+      }
+      return;
+    }
+    await this.cleanOrphansRenameToHash(100);
+    const contentRaw = await this.app.vault.read(file).catch(() => null);
+    const content = this.normalizeText(contentRaw);
+    if (content == null) return;
+    const hash = await this.sha128Hex(content);
+    const orphanRoot = (0, import_obsidian.normalizePath)(this.editHistoryRootFolder + "/_ORPHAN");
+    const src = (0, import_obsidian.normalizePath)(orphanRoot + "/" + hash + EDIT_HISTORY_FILE_EXT);
+    let data = await this.app.vault.adapter.readBinary(src).catch(() => null);
+    if (data == null) {
+      const adoptedSrc = (0, import_obsidian.normalizePath)(orphanRoot + "/_ADOPTED/" + hash + EDIT_HISTORY_FILE_EXT);
+      data = await this.app.vault.adapter.readBinary(adoptedSrc).catch(() => null);
+      if (data == null) {
+        const matched = await this.tryAdoptByContentMatch(file, content);
+        if (matched) return;
+        return;
+      }
+    }
+    const dir = target.substring(0, target.lastIndexOf("/") + 1);
+    await this.app.vault.adapter.mkdir(dir).catch(() => null);
+    const writeOk = await this.app.vault.adapter.writeBinary(target, data).then(() => true).catch(() => false);
+    if (!writeOk) {
+      new import_obsidian.Notice("Failed to attach history", 2000);
+      return;
+    }
+    try {
+      const zip = new import_jszip.default();
+      await zip.loadAsync(data);
+      const fps = [];
+      zip.forEach(function(relativePath) { fps.push(relativePath); });
+      this.sortEdits(fps);
+      if (this.statusBarItemEl) this.statusBarItemEl.setText(fps.length + " edits");
+      new import_obsidian.Notice("History auto-adopted", 2000);
+    } catch (_) {}
+    const adopted = (0, import_obsidian.normalizePath)(orphanRoot + "/_ADOPTED");
+    await this.app.vault.adapter.mkdir(adopted).catch(() => null);
+    const dest = (0, import_obsidian.normalizePath)(adopted + "/" + hash + EDIT_HISTORY_FILE_EXT);
+    await this.app.vault.adapter.writeBinary(dest, data).catch(() => null);
+    await this.app.vault.adapter.remove(src).catch(() => null);
+  }
+  async tryAdoptByContentMatch(file, content) {
+    const target = this.getEditHistoryFilepath(file.path);
+    const root = this.editHistoryRootFolder;
+    const listAll = async (dir) => {
+      const res = await this.app.vault.adapter.list(dir).catch(() => null);
+      if (!res) return [];
+      let files = res.files || [];
+      const folders = res.folders || [];
+      for (let f of folders) files = files.concat(await listAll(f));
+      return files;
+    };
+    const all = await listAll(root);
+    const len = content.length;
+    const h = this.quickHash(content);
+    for (let p of all) {
+      if (!p.endsWith(EDIT_HISTORY_FILE_EXT)) continue;
+      const rel = p.substring(root.length + 1);
+      const notePath = rel.substring(0, rel.length - EDIT_HISTORY_FILE_EXT.length);
+      const note = this.app.vault.getAbstractFileByPath(notePath);
+      if (note && note instanceof import_obsidian.TFile) continue;
+      const data = await this.app.vault.adapter.readBinary(p).catch(() => null);
+      if (data == null) continue;
+      const latest = await this.getLatestRawFromZipArrayBuffer(data);
+      if (latest == null) continue;
+      const ln = this.normalizeText(latest);
+      if (ln.length === len && this.quickHash(ln) === h && ln === content) {
+        const dir = target.substring(0, target.lastIndexOf("/") + 1);
+        await this.app.vault.adapter.mkdir(dir).catch(() => null);
+        const wrote = await this.app.vault.adapter.writeBinary(target, data).then(() => true).catch(() => false);
+        if (!wrote) return false;
+        const adopted = (0, import_obsidian.normalizePath)(root + "/_ORPHAN/_ADOPTED");
+        await this.app.vault.adapter.mkdir(adopted).catch(() => null);
+        const dest = (0, import_obsidian.normalizePath)(adopted + "/" + (await this.sha128Hex(latest)) + EDIT_HISTORY_FILE_EXT);
+        await this.app.vault.adapter.writeBinary(dest, data).catch(() => null);
+        await this.app.vault.adapter.remove(p).catch(() => null);
+        try {
+          const zip = new import_jszip.default();
+          await zip.loadAsync(data);
+          const fps = [];
+          zip.forEach(function(relativePath) { fps.push(relativePath); });
+          this.sortEdits(fps);
+          if (this.statusBarItemEl) this.statusBarItemEl.setText(fps.length + " edits");
+        } catch (_) {}
+        new import_obsidian.Notice("History auto-adopted", 2000);
+        return true;
+      }
+    }
+    return false;
+  }
+  async autoAdoptOrphans() {
+    if (this.autoAdoptInProgress) return;
+    this.autoAdoptInProgress = true;
+    try {
+      const root = this.editHistoryRootFolder;
+      const listAll = async (dir) => {
+        const res = await this.app.vault.adapter.list(dir).catch(() => null);
+        if (!res) return [];
+        let files = res.files || [];
+        const folders = res.folders || [];
+        for (let f of folders) {
+          const sub = await listAll(f);
+          files = files.concat(sub);
+        }
+        return files;
+      };
+      const all = await listAll(root);
+      const entries = [];
+      for (let p of all) {
+        if (!p.endsWith(EDIT_HISTORY_FILE_EXT)) continue;
+        const rel = p.substring(root.length + 1);
+        const notePath = rel.substring(0, rel.length - EDIT_HISTORY_FILE_EXT.length);
+        const note = this.app.vault.getAbstractFileByPath(notePath);
+        if (!(note && note instanceof import_obsidian.TFile)) {
+          const st = await this.app.vault.adapter.stat(p).catch(() => null);
+          const m = st && st.mtime ? st.mtime : 0;
+          entries.push({ p, m });
+        }
+      }
+      entries.sort((a, b) => b.m - a.m);
+      const orphans = entries.slice(0, this.autoAdoptLimitOrphans);
+      let files = this.app.vault.getFiles().filter((f) => this.keepEditHistoryForFile(f));
+      files.sort((a, b) => Math.max(b.stat.mtime, b.stat.ctime) - Math.max(a.stat.mtime, a.stat.ctime));
+      files = files.slice(0, this.autoAdoptLimitNotes);
+      const noteInfos = [];
+      for (let f of files) {
+        const content = await this.app.vault.read(f).catch(() => null);
+        if (content == null) continue;
+        noteInfos.push({ f, len: content.length, h: this.quickHash(content), c: content });
+      }
+      for (let o of orphans) {
+        const data = await this.app.vault.adapter.readBinary(o.p).catch(() => null);
+        if (data == null) continue;
+        const zip = new import_jszip.default();
+        await zip.loadAsync(data);
+        const fps = [];
+        zip.forEach(function(relativePath) {
+          fps.push(relativePath);
+        });
+        this.sortEdits(fps);
+        let latest = null;
+        for (let fp of fps) {
+          if (!this.getEditIsDiff(fp)) {
+            latest = fp;
+            break;
+          }
+        }
+        if (!latest) continue;
+        const latestData = await zip.file(latest).async("string");
+    const latestNorm = this.normalizeText(latestData);
+    const len = latestNorm.length;
+    const h = this.quickHash(latestNorm);
+        for (let ni of noteInfos) {
+          if (ni.len !== len || ni.h !== h) continue;
+          if (ni.c === latestNorm) {
+            const target = this.getEditHistoryFilepath(ni.f.path);
+            const exists = this.app.vault.getAbstractFileByPath(target);
+            if (!(exists && exists instanceof import_obsidian.TFile)) {
+              const dir = target.substring(0, target.lastIndexOf("/") + 1);
+              await this.app.vault.adapter.mkdir(dir).catch(() => null);
+              const wrote = await this.app.vault.adapter.writeBinary(target, data).then(() => true).catch(() => false);
+              if (!wrote) {
+                new import_obsidian.Notice("Failed to attach history", 2000);
+                break;
+              }
+              const orphanRoot = (0, import_obsidian.normalizePath)(root + "/_ORPHAN/_ADOPTED");
+              await this.app.vault.adapter.mkdir(orphanRoot).catch(() => null);
+              const dest = (0, import_obsidian.normalizePath)(orphanRoot + "/" + h + EDIT_HISTORY_FILE_EXT);
+              const dd = dest.substring(0, dest.lastIndexOf("/") + 1);
+              await this.app.vault.adapter.mkdir(dd).catch(() => null);
+              await this.app.vault.adapter.writeBinary(dest, data).catch(() => null);
+              await this.app.vault.adapter.remove(o.p).catch(() => null);
+            }
+            break;
+          }
+        }
+      }
+    } finally {
+      this.autoAdoptInProgress = false;
+    }
+  }
   commaSeparatedToList(s) {
     let list = [];
     if (s != "") {
@@ -4592,10 +4892,11 @@ var EditHistory = class extends import_obsidian.Plugin {
     this.maxEditAgeMs = parseInt(settings.maxEditAge) * 1e3 || Infinity;
     this.extensionWhitelist = this.commaSeparatedToList(settings.extensionWhitelist);
     this.substringBlacklist = this.commaSeparatedToList(settings.substringBlacklist);
-    this.maxEditHistoryFileSize = parseInt(settings.maxHistoryFileSizeKB) * 1024 || Infinity;
-    this.editHistoryRootFolder = settings.editHistoryRootFolder;
-    this.language = settings.language || "zh";
-  }
+  this.maxEditHistoryFileSize = parseInt(settings.maxHistoryFileSizeKB) * 1024 || Infinity;
+  this.editHistoryRootFolder = settings.editHistoryRootFolder;
+  this.language = settings.language || "zh";
+  this.controlStyle = settings.controlStyle || "button";
+}
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.parseSettings(this.settings);
@@ -4606,8 +4907,19 @@ var EditHistory = class extends import_obsidian.Plugin {
   }
   async onload() {
     await this.loadSettings();
+    if (this.editHistoryRootFolder) {
+      await this.app.vault.adapter.mkdir(this.editHistoryRootFolder).catch(() => null);
+    }
     let dmpobj = new import_diff_match_patch_ts.DiffMatchPatch();
     logInfo("onLoad");
+    const plugin = this;
+    this.autoAdoptLimitOrphans = 100;
+    this.autoAdoptLimitNotes = 100;
+    this.autoAdoptIntervalMs = 600000;
+    this.autoAdoptInProgress = false;
+    this.orphanAutoAdoptTimer = setInterval(async () => {
+      await this.autoAdoptOrphans();
+    }, this.autoAdoptIntervalMs);
     this.registerEvent(this.app.vault.on("modify", async (fileOrFolder, force = false) => {
       logInfo("vault modify", fileOrFolder.path);
       if (!this.keepEditHistoryForFile(fileOrFolder)) {
@@ -4621,14 +4933,20 @@ var EditHistory = class extends import_obsidian.Plugin {
       let file = fileOrFolder;
       let zipFilepath = this.getEditHistoryFilepath(file.path);
       let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+      let zipStatMtime = 0;
       if (zipFile != null && !(zipFile instanceof import_obsidian.TFile)) {
-        logError("Edit history file is not a file", zipFilepath);
-        return;
+        const st = await this.app.vault.adapter.stat(zipFilepath).catch(() => null);
+        zipStatMtime = st && st.mtime ? st.mtime : 0;
+      } else if (zipFile != null) {
+        zipStatMtime = zipFile.stat.mtime;
+      } else {
+        const st = await this.app.vault.adapter.stat(zipFilepath).catch(() => null);
+        zipStatMtime = st && st.mtime ? st.mtime : 0;
       }
-      if (!force && zipFile != null && file.stat.mtime - zipFile.stat.mtime < this.minMsBetweenEdits) {
+      if (!force && zipStatMtime > 0 && file.stat.mtime - zipStatMtime < this.minMsBetweenEdits) {
         logDbg(
           "Need to pass",
-          (this.minMsBetweenEdits - (file.stat.mtime - zipFile.stat.mtime)) / 1e3,
+          (this.minMsBetweenEdits - (file.stat.mtime - zipStatMtime)) / 1e3,
           "s between edits, ignoring"
         );
         return;
@@ -4636,7 +4954,12 @@ var EditHistory = class extends import_obsidian.Plugin {
       let fileData = await this.app.vault.read(file);
       let newFilename = this.buildEditFilename(file.stat.mtime, false);
       let zip = new import_jszip.default();
-      let zipData = zipFile == null ? null : await this.app.vault.readBinary(zipFile);
+      let zipData = null;
+      if (zipFile != null && zipFile instanceof import_obsidian.TFile) {
+        zipData = await this.app.vault.readBinary(zipFile);
+      } else {
+        zipData = await this.app.vault.adapter.readBinary(zipFilepath).catch(() => null);
+      }
       let numEdits = 0;
       if (zipData != null) {
         await zip.loadAsync(zipData);
@@ -4697,8 +5020,8 @@ var EditHistory = class extends import_obsidian.Plugin {
           let mostRecentFilename = filepaths[0];
           let mostRecentFile = zip.file(mostRecentFilename);
           if (this.getEditEpoch(mostRecentFilename) == this.getEditEpoch(newFilename)) {
-            logInfo("Delaying entry due to colliding epochs");
-            return;
+            const bumpedMs = this.getEditEpoch(newFilename) + 1e3;
+            newFilename = this.buildEditFilename(bumpedMs, false);
           }
           logInfo("unpacking " + mostRecentFilename);
           let prevFileData = await mostRecentFile.async("string");
@@ -4736,21 +5059,19 @@ var EditHistory = class extends import_obsidian.Plugin {
       logInfo("Storing", newFilename, " with date", dateWithOffset);
       zip.file(newFilename, fileData, { date: dateWithOffset, compression: "DEFLATE" });
       let newZipData = await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
-      if (zipFile == null) {
-        let dirpath = zipFilepath.substring(0, zipFilepath.lastIndexOf("/") + 1);
-        logInfo("Conservatively creating dir", dirpath);
-        await this.app.vault.createFolder(dirpath).catch(() => null);
-        let zipFile2 = await this.app.vault.createBinary(zipFilepath, newZipData);
-        if (zipFile2 == null) {
-          logError("Can't create edit history file", zipFilepath);
+      let dirpath = zipFilepath.substring(0, zipFilepath.lastIndexOf("/") + 1);
+      await this.app.vault.adapter.mkdir(dirpath).catch(() => null);
+      await this.app.vault.adapter.writeBinary(zipFilepath, newZipData).catch(async () => {
+        if (zipFile != null && zipFile instanceof import_obsidian.TFile) {
+          await this.app.vault.modifyBinary(zipFile, newZipData);
+        } else {
+          logError("Can't write edit history file", zipFilepath);
           return;
         }
-      } else {
-        await this.app.vault.modifyBinary(zipFile, newZipData);
-      }
+      });
       this.statusBarItemEl.setText(numEdits + 1 + " edits");
     }));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+    this.registerEvent(this.app.vault.on("rename", async (file, oldPath) => {
       logInfo("vault rename path", file.path);
       if (file instanceof import_obsidian.TFolder && file.path == this.editHistoryRootFolder) {
         logInfo(
@@ -4776,15 +5097,40 @@ var EditHistory = class extends import_obsidian.Plugin {
         logDbg("Not moving edit history, expected to be moved later alongside parent folder");
         return;
       }
-      let zipFilepath = this.getEditHistoryFilepath(oldPath);
-      let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-      if (zipFile != null) {
-        let newZipFilepath = this.getEditHistoryFilepath(file.path);
-        logInfo("Renaming edit history file", zipFilepath, "to", newZipFilepath);
+      const oldZipFilepath = this.getEditHistoryFilepath(oldPath);
+      const newZipFilepath = this.getEditHistoryFilepath(file.path);
+      let zipFile = this.app.vault.getAbstractFileByPath(oldZipFilepath);
+      if (zipFile != null && zipFile instanceof import_obsidian.TFile) {
+        logInfo("Renaming edit history file", oldZipFilepath, "to", newZipFilepath);
         this.app.vault.rename(zipFile, newZipFilepath);
+      } else {
+        const data = await this.app.vault.adapter.readBinary(oldZipFilepath).catch(() => null);
+        if (data != null) {
+          const dirpath = newZipFilepath.substring(0, newZipFilepath.lastIndexOf("/") + 1);
+          await this.app.vault.adapter.mkdir(dirpath).catch(() => null);
+          logInfo("Copying edit history file", oldZipFilepath, "to", newZipFilepath);
+          const wrote = await this.app.vault.adapter.writeBinary(newZipFilepath, data).then(() => true).catch(() => false);
+          if (wrote) {
+            await this.app.vault.adapter.remove(oldZipFilepath).catch(() => null);
+          } else {
+            logWarn("Failed to copy history to new path", newZipFilepath);
+          }
+        } else {
+          logDbg("No existing history file to move", oldZipFilepath);
+        }
       }
     }));
-    this.registerEvent(this.app.vault.on("delete", (file) => {
+    this.registerEvent(this.app.vault.on("create", async (file) => {
+      if (!this.keepEditHistoryForFile(file)) {
+        return;
+      }
+      try {
+        await plugin.onFileOpenAutoAdopt(file);
+      } catch (e) {
+        logWarn("autoAdopt on create error", e);
+      }
+    }));
+    this.registerEvent(this.app.vault.on("delete", async (file) => {
       logInfo("vault delete path", file.path);
       if (!this.keepEditHistoryForFile(file)) {
         logDbg("Ignoring non whitelisted file", file.path);
@@ -4793,14 +5139,21 @@ var EditHistory = class extends import_obsidian.Plugin {
       let zipFilepath = this.getEditHistoryFilepath(file.path);
       let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
       if (zipFile != null) {
-        logInfo("Deleting edit history file", zipFilepath);
-        this.app.vault.delete(zipFile);
+        logInfo("Archiving edit history file to _ORPHAN", zipFilepath);
+        const data = zipFile instanceof import_obsidian.TFile ? await this.app.vault.readBinary(zipFile) : await this.app.vault.adapter.readBinary(zipFilepath).catch(() => null);
+        if (data != null) {
+          const latest = await this.getLatestRawFromZipArrayBuffer(data).catch(() => null);
+          const orphanRoot = (0, import_obsidian.normalizePath)(this.editHistoryRootFolder + "/_ORPHAN");
+          await this.app.vault.adapter.mkdir(orphanRoot).catch(() => null);
+          const hash = await this.sha128Hex(this.normalizeText(latest || ""));
+          const dest = (0, import_obsidian.normalizePath)(orphanRoot + "/" + hash + EDIT_HISTORY_FILE_EXT);
+          await this.app.vault.adapter.writeBinary(dest, data).catch(() => null);
+        }
+        this.app.vault.adapter.remove(zipFilepath).catch(() => null);
       }
     }));
     const ribbonIconEl = this.addRibbonIcon("clock", "Open edit history", (evt) => {
-      if (this.keepEditHistoryForActiveFile()) {
-        new EditHistoryModal(this).open();
-      }
+      new EditHistoryModal(this).open();
     });
     const statusBarItemEl = this.addStatusBarItem();
     statusBarItemEl.setText("? edits");
@@ -4808,11 +5161,9 @@ var EditHistory = class extends import_obsidian.Plugin {
     this.statusBarItemEl = statusBarItemEl;
     const plugin = this;
     statusBarItemEl.onclick = function() {
-      if (plugin.keepEditHistoryForActiveFile()) {
-        new EditHistoryModal(plugin).open();
-      }
+      new EditHistoryModal(plugin).open();
     };
-    this.statusBarItemEl.toggle(this.settings.showOnStatusBar);
+    this.statusBarItemEl.style.display = this.settings.showOnStatusBar ? "" : "none";
     this.addCommand({
       id: "open-edit-history",
       name: "Open edit history for this file",
@@ -4840,10 +5191,129 @@ var EditHistory = class extends import_obsidian.Plugin {
         return false;
       }
     });
+    this.addCommand({
+      id: "clean-orphan-edit-histories",
+      name: "Clean orphan edit histories",
+      callback: async () => {
+        const root = this.editHistoryRootFolder;
+        const listAll = async (dir) => {
+          const res = await this.app.vault.adapter.list(dir).catch(() => null);
+          if (!res) return [];
+          let files = res.files || [];
+          const folders = res.folders || [];
+          for (let f of folders) {
+            const sub = await listAll(f);
+            files = files.concat(sub);
+          }
+          return files;
+        };
+        const all = await listAll(root);
+        const orphans = [];
+        for (let p of all) {
+          if (!p.endsWith(EDIT_HISTORY_FILE_EXT)) continue;
+          const rel = p.substring(root.length + 1);
+          const notePath = rel.substring(0, rel.length - EDIT_HISTORY_FILE_EXT.length);
+          const note = this.app.vault.getAbstractFileByPath(notePath);
+          if (!(note && note instanceof import_obsidian.TFile)) {
+            orphans.push(p);
+          }
+        }
+        if (orphans.length === 0) {
+          new import_obsidian.Notice("No orphan history files", 2000);
+          return;
+        }
+        const orphanRoot = (0, import_obsidian.normalizePath)(root + "/_ORPHAN");
+        await this.app.vault.adapter.mkdir(orphanRoot).catch(() => null);
+        for (let p of orphans) {
+          const rel = p.substring(root.length + 1);
+          const dest = (0, import_obsidian.normalizePath)(orphanRoot + "/" + rel);
+          const dir = dest.substring(0, dest.lastIndexOf("/") + 1);
+          await this.app.vault.adapter.mkdir(dir).catch(() => null);
+          const data = await this.app.vault.adapter.readBinary(p).catch(() => null);
+          if (data != null) {
+            await this.app.vault.adapter.writeBinary(dest, data).catch(() => null);
+          }
+        }
+        new import_obsidian.Notice("Moved " + orphans.length + " orphan histories to _ORPHAN", 3000);
+      }
+    });
+    this.addCommand({
+      id: "adopt-orphan-history-for-active-file",
+      name: "Adopt orphan history for active file",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (file && this.keepEditHistoryForFile(file)) {
+          if (!checking) {
+            (async () => {
+              const root = this.editHistoryRootFolder;
+              const targetHistory = this.getEditHistoryFilepath(file.path);
+              const exists = this.app.vault.getAbstractFileByPath(targetHistory);
+              if (exists && exists instanceof import_obsidian.TFile) {
+                new import_obsidian.Notice("History already attached", 2000);
+                return;
+              }
+              const listAll = async (dir) => {
+                const res = await this.app.vault.adapter.list(dir).catch(() => null);
+                if (!res) return [];
+                let files = res.files || [];
+                const folders = res.folders || [];
+                for (let f of folders) {
+                  const sub = await listAll(f);
+                  files = files.concat(sub);
+                }
+                return files;
+              };
+              const all = await listAll(root);
+              const base = file.basename.toLowerCase();
+              const candidates = [];
+              for (let p of all) {
+                if (!p.endsWith(EDIT_HISTORY_FILE_EXT)) continue;
+                const rel = p.substring(root.length + 1);
+                const notePath = rel.substring(0, rel.length - EDIT_HISTORY_FILE_EXT.length);
+                const name = notePath.substring(notePath.lastIndexOf("/") + 1).toLowerCase();
+                const nameNoExt = name.includes(".") ? name.substring(0, name.lastIndexOf(".")) : name;
+                if (nameNoExt === base) {
+                  candidates.push(p);
+                }
+              }
+              if (candidates.length === 0) {
+                new import_obsidian.Notice("No matching orphan history found", 2500);
+                return;
+              }
+              let best = candidates[0];
+              let bestM = 0;
+              for (let p of candidates) {
+                const st = await this.app.vault.adapter.stat(p).catch(() => null);
+                const m = st && st.mtime ? st.mtime : 0;
+                if (m >= bestM) {
+                  best = p;
+                  bestM = m;
+                }
+              }
+              const data = await this.app.vault.adapter.readBinary(best).catch(() => null);
+              if (data == null) {
+                new import_obsidian.Notice("Failed to read orphan history", 2500);
+                return;
+              }
+              const dirpath = targetHistory.substring(0, targetHistory.lastIndexOf("/") + 1);
+              await this.app.vault.adapter.mkdir(dirpath).catch(() => null);
+              await this.app.vault.adapter.writeBinary(targetHistory, data).catch(() => null);
+              new import_obsidian.Notice("History adopted for current file", 2500);
+            })();
+          }
+          return true;
+        }
+        return false;
+      }
+    });
     this.addSettingTab(new EditHistorySettingTab(this.app, this));
   }
   onunload() {
     logInfo("unload");
+    if (this.orphanAutoAdoptTimer) {
+      clearInterval(this.orphanAutoAdoptTimer);
+      this.orphanAutoAdoptTimer = null;
+    }
   }
 };
 var EditHistoryModal = class extends import_obsidian.Modal {
@@ -4940,7 +5410,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
           if (optionFileTime == cellFileTime) {
             if (i != selectEl.selectedIndex) {
               selectEl.selectedIndex = i;
-              selectEl.trigger("change");
+              selectEl.dispatchEvent(new Event("change"));
             }
             break;
           }
@@ -5144,15 +5614,29 @@ var EditHistoryModal = class extends import_obsidian.Modal {
     const zip = new import_jszip.default();
     const zipFilepath = this.plugin.getEditHistoryFilepath(file.path);
     logInfo("Opening zip file ", zipFilepath);
-    const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+    let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
     if (zipFile == null || !(zipFile instanceof import_obsidian.TFile)) {
-      logWarn("No history file or not a file", zipFilepath);
-      contentEl.createEl("p", { text: "No edit history file" });
-      return;
+      const allFiles = this.app.vault.getFiles();
+      const rootPrefix = this.plugin.editHistoryRootFolder + "/";
+      const suffix = file.path + EDIT_HISTORY_FILE_EXT;
+      zipFile = allFiles.find((f) => f.path.startsWith(rootPrefix) && f.path.endsWith(suffix));
     }
-    const zipData = await this.app.vault.readBinary(zipFile);
+    if (zipFile == null || !(zipFile instanceof import_obsidian.TFile)) {
+      logDbg("History file not in vault yet, reading via adapter", zipFilepath);
+    }
+    let zipData = null;
+    if (zipFile instanceof import_obsidian.TFile) {
+      zipData = await this.app.vault.readBinary(zipFile);
+    } else {
+      try {
+        zipData = await this.app.vault.adapter.readBinary(zipFilepath);
+        zipFile = { stat: { size: zipData ? zipData.byteLength : 0 } };
+      } catch (e) {
+        zipData = null;
+      }
+    }
     if (zipData == null) {
-      logWarn("Unable to read history file");
+      logDbg("Unable to read history file via vault/adapter");
       contentEl.createEl("p", { text: "No edit history" });
       return;
     }
@@ -5183,36 +5667,55 @@ var EditHistoryModal = class extends import_obsidian.Modal {
     const select = new import_obsidian.DropdownComponent(control);
     select.selectEl.focus();
     const diffDisplaySelect = new import_obsidian.DropdownComponent(control).addOptions(diffDisplayFormatToString).setValue(this.plugin.settings.diffDisplayFormat).onChange(async () => {
-      select.selectEl.trigger("change");
+      select.selectEl.dispatchEvent(new Event("change"));
     });
     const diffInfo = control.createEl("span");
-    const copyButton = new import_obsidian.ButtonComponent(control).setButtonText("Copy").setClass("mod-cta").onClick(() => {
-      logInfo("Copied to clipboard");
-      navigator.clipboard.writeText(this.currentVersionData);
-    });
-    const prevButton = new import_obsidian.ButtonComponent(control).setButtonText("Previous").setClass("mod-cta").onClick(() => {
-      logInfo("Prev diff");
-      if (this.diffElements.length > 0) {
-        this.diffElements[this.curDiffIndex].removeClass("current");
-        this.curDiffIndex = (this.curDiffIndex + this.diffElements.length - 1) % this.diffElements.length;
-        this.diffElements[this.curDiffIndex].scrollIntoView({ block: "center" });
-        this.diffElements[this.curDiffIndex].addClass("current");
-        diffInfo.setText(this.curDiffIndex + 1 + "/" + this.diffElements.length + " diff" + (this.diffElements.length != 1 ? "s" : ""));
-      }
-    });
-    const nextButton = new import_obsidian.ButtonComponent(control).setButtonText("Next").setClass("mod-cta").onClick(() => {
-      logInfo("Next diff");
-      if (this.diffElements.length > 0) {
-        this.diffElements[this.curDiffIndex].removeClass("current");
-        this.curDiffIndex = (this.curDiffIndex + 1) % this.diffElements.length;
-        this.diffElements[this.curDiffIndex].scrollIntoView({ block: "center" });
-        this.diffElements[this.curDiffIndex].addClass("current");
-        diffInfo.setText(this.curDiffIndex + 1 + "/" + this.diffElements.length + " diff" + (this.diffElements.length != 1 ? "s" : ""));
-      }
-    });
-    control.createEl("span").setText("Whitespace");
+    const copyLabel = this.plugin.settings.language === "zh" ? "复制" : this.plugin.settings.language === "fr" ? "Copier" : "Copy";
+    const prevLabel = this.plugin.settings.language === "zh" ? "上一处" : this.plugin.settings.language === "fr" ? "Précédent" : "Previous";
+    const nextLabel = this.plugin.settings.language === "zh" ? "下一处" : this.plugin.settings.language === "fr" ? "Suivant" : "Next";
+    const wsLabel = this.plugin.settings.language === "zh" ? "空白字符" : this.plugin.settings.language === "fr" ? "Espaces" : "Whitespace";
+    const copiedMsg = this.plugin.settings.language === "zh" ? "已复制" : this.plugin.settings.language === "fr" ? "Copié" : "Copied";
+    let copyButton, prevButton, nextButton;
+    copyButton = new import_obsidian.ButtonComponent(control).setButtonText(copyLabel).setClass("mod-cta").onClick(() => {
+        try {
+          navigator.clipboard.writeText(this.currentVersionData);
+        } catch (e) {
+          const ta = document.createElement("textarea");
+          ta.value = this.currentVersionData || "";
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+        }
+        new import_obsidian.Notice(copiedMsg, 1500);
+      });
+      prevButton = new import_obsidian.ButtonComponent(control).setButtonText(prevLabel).setClass("mod-cta").onClick(() => {
+        logInfo("Prev diff");
+        if (this.diffElements.length > 0) {
+          this.diffElements[this.curDiffIndex].classList.remove("current");
+          this.curDiffIndex = (this.curDiffIndex + this.diffElements.length - 1) % this.diffElements.length;
+          this.diffElements[this.curDiffIndex].scrollIntoView({ block: "center" });
+          this.diffElements[this.curDiffIndex].classList.add("current");
+          const infoText = this.plugin.settings.language === "zh" ? `${this.curDiffIndex + 1}/${this.diffElements.length} 处差异` : this.plugin.settings.language === "fr" ? `${this.curDiffIndex + 1}/${this.diffElements.length} différence${this.diffElements.length != 1 ? "s" : ""}` : `${this.curDiffIndex + 1}/${this.diffElements.length} diff${this.diffElements.length != 1 ? "s" : ""}`;
+          diffInfo.textContent = infoText;
+        }
+      });
+      nextButton = new import_obsidian.ButtonComponent(control).setButtonText(nextLabel).setClass("mod-cta").onClick(() => {
+        logInfo("Next diff");
+        if (this.diffElements.length > 0) {
+          this.diffElements[this.curDiffIndex].classList.remove("current");
+          this.curDiffIndex = (this.curDiffIndex + 1) % this.diffElements.length;
+          this.diffElements[this.curDiffIndex].scrollIntoView({ block: "center" });
+          this.diffElements[this.curDiffIndex].classList.add("current");
+          const infoText = this.plugin.settings.language === "zh" ? `${this.curDiffIndex + 1}/${this.diffElements.length} 处差异` : this.plugin.settings.language === "fr" ? `${this.curDiffIndex + 1}/${this.diffElements.length} différence${this.diffElements.length != 1 ? "s" : ""}` : `${this.curDiffIndex + 1}/${this.diffElements.length} diff${this.diffElements.length != 1 ? "s" : ""}`;
+          diffInfo.textContent = infoText;
+        }
+      });
+    control.createEl("span").setText(wsLabel);
     const whitespaceCheckbox = new import_obsidian.ToggleComponent(control).setValue(this.plugin.settings.showWhitespace).onChange(async () => {
-      select.selectEl.trigger("change");
+      select.selectEl.dispatchEvent(new Event("change"));
     });
     contentEl.setAttr("tabindex", 0);
     contentEl.addEventListener("keydown", (event) => {
@@ -5221,27 +5724,27 @@ var EditHistoryModal = class extends import_obsidian.Modal {
       const navigateDate = event.ctrlKey && event.shiftKey;
       if (event.key === "p" || navigateDiff && event.key === "ArrowUp") {
         event.preventDefault();
-        prevButton.buttonEl.trigger("click");
+        if (prevButton && prevButton.buttonEl) prevButton.buttonEl.click();
       } else if (event.key === "P" || navigateDate && event.key === "ArrowUp") {
         event.preventDefault();
         const nextIndex = select.selectEl.selectedIndex - 1;
         if (nextIndex >= 0) {
           select.selectEl.selectedIndex = nextIndex;
-          select.selectEl.trigger("change");
+          select.selectEl.dispatchEvent(new Event("change"));
         }
       } else if (event.key === "n" || navigateDiff && event.key === "ArrowDown") {
         event.preventDefault();
-        nextButton.buttonEl.trigger("click");
+        if (nextButton && nextButton.buttonEl) nextButton.buttonEl.click();
       } else if (event.key === "N" || navigateDate && event.key === "ArrowDown") {
         event.preventDefault();
         const nextIndex = select.selectEl.selectedIndex + 1;
         if (nextIndex < select.selectEl.options.length) {
           select.selectEl.selectedIndex = nextIndex;
-          select.selectEl.trigger("change");
+          select.selectEl.dispatchEvent(new Event("change"));
         }
       } else if (event.key === "c" && event.ctrlKey) {
         event.preventDefault();
-        copyButton.buttonEl.trigger("click");
+        if (copyButton && copyButton.buttonEl) copyButton.buttonEl.click();
       }
     });
     const diffDiv = contentEl.createDiv("diff-div");
@@ -5253,12 +5756,12 @@ var EditHistoryModal = class extends import_obsidian.Modal {
       const dayCell = document.getElementById(`calendar-${selectedFileTime}`);
       if (dayCell) {
         if (selectedDayCell) {
-          selectedDayCell.addClass("calendar-level");
-          selectedDayCell.removeClass("calendar-selected");
+          selectedDayCell.classList.add("calendar-level");
+          selectedDayCell.classList.remove("calendar-selected");
         }
         selectedDayCell = dayCell;
-        selectedDayCell.addClass("calendar-selected");
-        selectedDayCell.removeClass("calendar-level");
+        selectedDayCell.classList.add("calendar-selected");
+        selectedDayCell.classList.remove("calendar-level");
       } else {
         this.renderCalendar(calendarDiv, select, zipFile, zip, filepaths);
         selectedDayCell = document.getElementById(`calendar-${selectedFileTime}`);
@@ -5315,8 +5818,17 @@ var EditHistoryModal = class extends import_obsidian.Modal {
       const diffElements = diffDiv.querySelectorAll(".diff-line");
       this.diffElements = diffElements;
       (_a = this.diffElements[this.curDiffIndex]) == null ? void 0 : _a.scrollIntoView({ block: "center" });
-      (_b = this.diffElements[this.curDiffIndex]) == null ? void 0 : _b.addClass("current");
-      diffInfo.setText(this.curDiffIndex + 1 + "/" + this.diffElements.length + " diff" + (this.diffElements.length != 1 ? "s" : ""));
+      (_b = this.diffElements[this.curDiffIndex]) == null ? void 0 : _b.classList.add("current");
+      const infoText = this.plugin.settings.language === "zh" ? `${this.curDiffIndex + 1}/${this.diffElements.length} 处差异` : this.plugin.settings.language === "fr" ? `${this.curDiffIndex + 1}/${this.diffElements.length} différence${this.diffElements.length != 1 ? "s" : ""}` : `${this.curDiffIndex + 1}/${this.diffElements.length} diff${this.diffElements.length != 1 ? "s" : ""}`;
+      diffInfo.textContent = infoText;
+      const disableNav = this.diffElements.length <= 1;
+      if (typeof prevButton.setDisabled === "function") {
+        prevButton.setDisabled(disableNav);
+        nextButton.setDisabled(disableNav);
+      } else {
+        if (prevButton.buttonEl) prevButton.buttonEl.disabled = disableNav;
+        if (nextButton.buttonEl) nextButton.buttonEl.disabled = disableNav;
+      }
       const table = diffDiv.querySelector("table");
       const cells = table == null ? void 0 : table.querySelectorAll("td.diff-time");
       cells == null ? void 0 : cells.forEach((cell) => {
@@ -5329,7 +5841,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
             if (options[i].text == text) {
               if (i != selectEl.selectedIndex) {
                 selectEl.selectedIndex = i;
-                selectEl.trigger("change");
+                selectEl.dispatchEvent(new Event("change"));
               }
               break;
             }
@@ -5340,7 +5852,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
     for (let filepath of filepaths) {
       select.addOption(filepath, this.plugin.getEditLocalDateStr(filepath));
     }
-    select.selectEl.trigger("change");
+    select.selectEl.dispatchEvent(new Event("change"));
     this.plugin.statusBarItemEl.setText(filepaths.length + " edits");
   }
   onClose() {
@@ -5403,7 +5915,12 @@ var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
       logInfo("Show edits on status bar: " + value);
       this.plugin.settings.showOnStatusBar = value;
       await this.plugin.saveSettings();
-      this.plugin.statusBarItemEl.toggle(this.plugin.settings.showOnStatusBar);
+      this.plugin.statusBarItemEl.style.display = this.plugin.settings.showOnStatusBar ? "" : "none";
+    }));
+    new import_obsidian.Setting(containerEl).setName(this.plugin.settings.language === "zh" ? "控件样式" : this.plugin.settings.language === "fr" ? "Style des contrôles" : "Control style").setDesc(this.plugin.settings.language === "zh" ? "选择历史弹窗的控件样式：按钮或链接。" : this.plugin.settings.language === "fr" ? "Choisir le style des contrôles de la fenêtre d’historique : boutons ou liens." : "Choose the style of controls in the history modal: buttons or links.").addDropdown((dropdown) => dropdown.addOption("button", this.plugin.settings.language === "zh" ? "按钮" : this.plugin.settings.language === "fr" ? "Boutons" : "Buttons").addOption("link", this.plugin.settings.language === "zh" ? "链接" : this.plugin.settings.language === "fr" ? "Liens" : "Links").setValue(this.plugin.settings.controlStyle || "button").onChange(async (value) => {
+      this.plugin.settings.controlStyle = value;
+      await this.plugin.saveSettings();
+      this.display();
     }));
     new import_obsidian.Setting(containerEl).setName(this.plugin.settings.language === "zh" ? "差异展示方式" : this.plugin.settings.language === "fr" ? "Type d’affichage des diff" : "Diff display type").setDesc(this.plugin.settings.language === "zh" ? "在差异视图中选择：原始、时间线、行内、水平（并排）、垂直（上下）。" : this.plugin.settings.language === "fr" ? "Dans la vue des diff : brut, chronologie, en ligne, horizontal (côte à côte) ou vertical (haut-bas)." : "In the diff view, display the diff raw, timeline, inline, horizontally (side by side), or vertically (top by bottom).").addDropdown((dropdown) => {
       const opts = {

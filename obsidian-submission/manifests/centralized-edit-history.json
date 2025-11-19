@@ -1,0 +1,11 @@
+{
+  "id": "centralized-edit-history",
+  "name": "Centralized Edit History",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Centralizes edit history files (.ceh) into /.obsidian/centralized-edit-history, adds multi-language UI and immediate language refresh.",
+  "author": "icerhugo",
+  "authorUrl": "https://github.com/icerhugo",
+  "isDesktopOnly": false,
+  "repo": "icerhugo/centralized-edit-history"
+}

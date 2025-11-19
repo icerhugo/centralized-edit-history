@@ -131,3 +131,39 @@
     white-space: nowrap;
     font-family: 'Courier New', Courier, monospace;
 }
+
+.edit-history-modal-content .mod-cta {
+    transition: transform .12s ease, box-shadow .2s ease, filter .2s ease;
+    border-radius: var(--radius-s);
+}
+.edit-history-modal-content .mod-cta:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(0,0,0,.2);
+    filter: brightness(1.05);
+}
+.edit-history-modal-content .mod-cta:active {
+    transform: translateY(0);
+    box-shadow: none;
+    filter: brightness(.98);
+}
+.edit-history-modal-content .mod-cta[disabled] {
+    opacity: .6;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+    filter: none;
+}
+.edit-history-modal-content .eh-link {
+    color: var(--text-accent);
+    text-decoration: underline;
+    margin-right: var(--size-4-2);
+    cursor: pointer;
+}
+.edit-history-modal-content .eh-link:hover {
+    text-decoration: none;
+}
+.edit-history-modal-content .eh-link.eh-disabled {
+    opacity: .6;
+    pointer-events: none;
+    text-decoration: none;
+}
