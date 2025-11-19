@@ -1,0 +1,10 @@
+{
+    "id": "centralized-edit-history",
+    "name": "Centralized Edit History",
+    "version": "1.0.0-local",
+    "minAppVersion": "0.15.0",
+    "description": "Locally maintained fork of Edit History that centralizes .edtz files into .obsidian/edit-history to keep vault directories clean.",
+    "author": "icerhugo",
+    "authorUrl": "https://github.com/icerhugo",
+    "isDesktopOnly": false
+}
